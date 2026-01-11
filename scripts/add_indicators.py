@@ -20,18 +20,52 @@ from scipy.optimize import minimize
 
 from scripts.b_score_calculator import compute_B_score
 
+# Target alpha ranges for indicators (used to map optimizer [0,1] -> physical alpha ranges)
+# These match the requested typical ranges:
+# H (hydrophobicity): 1.0 - 2.5 (alpha = k'_EB / k'_Tol)
+# S (steric): 1.0 - 1.3 (alpha = k'_TMB / k'_EB)
+# A (pi/H-bond): 1.0 - 2.0 (alpha = k'_Phenol / k'_Nitro)
+# B (basic): 1.0 - 2.0 (alpha = k'_Aniline / k'_Nitro)
+# C (ionic): 1.0 - 3.0 (alpha = k'_BzNH2 / k'_Phenol)
+ALPHA_RANGES = {
+    "H": (1.0, 2.5),
+    "S": (1.0, 1.3),
+    "A": (1.0, 2.0),
+    "B_indicator": (1.0, 2.0),
+    "C": (1.0, 3.0),
+}
+
+
+def map_x_to_alpha(x: np.ndarray) -> np.ndarray:
+    """Map optimizer variables x in (0,1) to alpha ranges in ALPHA_RANGES.
+
+    x: array-like length 5 ordered [H,S,A,B_indicator,C]
+    returns: mapped alphas in same order
+    """
+    mapped = np.zeros_like(x)
+    keys = ["H", "S", "A", "B_indicator", "C"]
+    for i, k in enumerate(keys):
+        lo, hi = ALPHA_RANGES[k]
+        # linear map: x in (0,1) -> lo..hi
+        mapped[i] = lo + float(x[i]) * (hi - lo)
+    return mapped
+
 
 def invert_sample(B_obs: float, x_prior: np.ndarray, lambda_reg: float, maxiter: int) -> Tuple[np.ndarray, float, object]:
     bounds = [(1e-3, 1.0 - 1e-3)] * 5
 
     def obj(x: np.ndarray) -> float:
-        B = compute_B_score(x[0], x[1], x[2], x[3], x[4])
+        # map optimizer variables to physical alpha ranges before computing B
+        mapped = map_x_to_alpha(x)
+        B = compute_B_score(mapped[0], mapped[1], mapped[2], mapped[3], mapped[4])
         return float((B - B_obs) ** 2 + lambda_reg * np.sum((x - x_prior) ** 2))
 
     res = minimize(obj, x0=x_prior, bounds=bounds, method="L-BFGS-B", options={"maxiter": maxiter})
     x_opt = res.x
-    B_recalc = float(compute_B_score(x_opt[0], x_opt[1], x_opt[2], x_opt[3], x_opt[4]))
-    return x_opt, B_recalc, res
+    mapped_opt = map_x_to_alpha(x_opt)
+    B_recalc = float(compute_B_score(mapped_opt[0], mapped_opt[1], mapped_opt[2], mapped_opt[3], mapped_opt[4]))
+    # return mapped alphas (so stored columns reflect the physical alpha ranges)
+    return mapped_opt, B_recalc, res
 
 
 def process(df: pd.DataFrame, lambda_reg: float, maxiter: int, seed: int = None, limit: int = None) -> pd.DataFrame:
