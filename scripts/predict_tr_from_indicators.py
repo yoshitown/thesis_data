@@ -22,6 +22,7 @@ Example:
 
 """
 from pathlib import Path
+import os
 import argparse
 import sys
 import math
@@ -194,29 +195,16 @@ def predict(args: argparse.Namespace) -> pd.DataFrame:
     ind_df = read_indicators(Path(args.indicators))
     base_df = read_baseline(Path(args.baseline)) if args.baseline else None
 
-    # choose grouping: prefer condition+r+s if present
-    if {"r", "s"}.issubset(set(ind_df.columns)):
-        group_keys = ["condition", "r", "s"]
+    # prepare per-condition alphas (mean indicators) for hybrid per-sample predictions
+    if "condition" in ind_df.columns:
+        cond_groups = ind_df.groupby(["condition"])
     else:
-        group_keys = ["condition"]
-    groups = ind_df.groupby(group_keys)
+        cond_groups = [(None, ind_df)]
 
-    rows = []
-
-    # scales convert 0..1 indicator into alpha; default 1.0 (user can supply)
-    scales = {"H": args.scale_H, "S": args.scale_S, "A": args.scale_A, "B": args.scale_B, "C": args.scale_C}
-
-    clip_enabled = not getattr(args, "no_clip", False)
-    for group_key, g in groups:
-        if len(group_keys) == 3:
-            cond, r_val, s_val = group_key
-        else:
-            cond = group_key
-            r_val = None
-            s_val = None
-
+    alphas_by_condition = {}
+    for cond_key, g in cond_groups:
         mean = g[["H", "S", "A", "B_indicator", "C"]].mean()
-        mean_dict: Dict[str, float] = {
+        alphas_by_condition[cond_key] = {
             "H": float(mean["H"]),
             "S": float(mean["S"]),
             "A": float(mean["A"]),
@@ -224,105 +212,263 @@ def predict(args: argparse.Namespace) -> pd.DataFrame:
             "C": float(mean["C"]),
         }
 
-        # estimate or find baseline k for this condition,r,s
-        k_base = None
-        t0_use = float(args.t0)
-        note_base = ""
-        if base_df is not None:
-            k_est, t0_est, src = estimate_baseline_k(
-                base_df,
-                args.baseline_compound,
-                cond,
-                r_val,
-                s_val,
-                args.t0,
-                min_samples=args.fit_min_samples,
-                use_log=not getattr(args, "no_log_fit", False),
-                fit_global_if_sparse=getattr(args, "fit_global_if_sparse", False),
-            )
-            if k_est is not None:
-                k_base = float(k_est)
-                t0_use = float(t0_est)
-                note_base = f"baseline({src})"
+    # if not per-sample, keep old grouping behaviour
+    per_sample = getattr(args, "per_sample", False)
 
-        if k_base is None:
-            print(f"Warning: no baseline measurement for compound '{args.baseline_compound}' (condition={cond}, r={r_val}, s={s_val}); skipping", file=sys.stderr)
-            continue
+    
 
-        tR_base = tr_from_k(k_base, t0_use)
-        rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": args.baseline_compound, "k": k_base, "tR": tR_base, "note": note_base})
-
-        # derive other compounds according to DEFAULT_MAPPING
-        # compute alphas from mean indicators using scale
-        alphas = {}
-        for ind_key in ["H", "S", "A", "B", "C"]:
-            alphas[ind_key] = float(mean_dict[ind_key]) * float(scales[ind_key])
-
-        # compute Ethyl/Toluene/1,2,4-TMB chain if baseline is Ethylbenzene
-        if args.baseline_compound == "Ethylbenzene":
-            alpha_H = max(alphas["H"], 1e-8)
-            k_toluene = k_base / alpha_H
-            k_toluene = clip_k_if_needed(k_toluene, "Toluene", clip_enabled)
-            rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Toluene", "k": k_toluene, "tR": tr_from_k(k_toluene, t0_use), "note": "from H"})
-
-            alpha_S = alphas["S"]
-            k_124TMB = alpha_S * k_base
-            k_124TMB = clip_k_if_needed(k_124TMB, "1,2,4-TMB", clip_enabled)
-            rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "1,2,4-TMB", "k": k_124TMB, "tR": tr_from_k(k_124TMB, t0_use), "note": "from S"})
-
-        # If baseline is Phenol, derive Nitrobenzene (and Aniline) and Benzylamine
-        if args.baseline_compound == "Phenol":
-            alpha_A = max(alphas["A"], 1e-8)
-            k_nitro = k_base / alpha_A
-            k_nitro = clip_k_if_needed(k_nitro, "Nitrobenzene", clip_enabled)
-            rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Nitrobenzene", "k": k_nitro, "tR": tr_from_k(k_nitro, t0_use), "note": "from A"})
-
-            alpha_B = alphas["B"]
-            k_aniline = alpha_B * k_nitro
-            k_aniline = clip_k_if_needed(k_aniline, "Aniline", clip_enabled)
-            rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Aniline", "k": k_aniline, "tR": tr_from_k(k_aniline, t0_use), "note": "from B and Nitrobenzene"})
-
-            alpha_C = alphas["C"]
-            k_benzyl = alpha_C * k_base
-            k_benzyl = clip_k_if_needed(k_benzyl, "Benzylamine", clip_enabled)
-            rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Benzylamine", "k": k_benzyl, "tR": tr_from_k(k_benzyl, t0_use), "note": "from C and Phenol baseline"})
-
-        # A/B chain: where Nitrobenzene or Phenol measured in baseline file for same condition, try to use them
-        nitro_row = base_df[(base_df["compound"] == "Nitrobenzene") & (base_df.get("condition", None) == cond)] if base_df is not None else pd.DataFrame()
-        phenol_row = base_df[(base_df["compound"] == "Phenol") & (base_df.get("condition", None) == cond)] if base_df is not None else pd.DataFrame()
-        if len(nitro_row) > 0 and len(phenol_row) > 0:
-            t0_n = float(nitro_row.iloc[0].get("t0", args.t0))
-            k_nitro_meas = k_from_tr(float(nitro_row.iloc[0]["tR"]), t0_n)
-            alpha_A = alphas["A"]
-            k_phenol_pred = alpha_A * k_nitro_meas
-            k_phenol_pred = clip_k_if_needed(k_phenol_pred, "Phenol", clip_enabled)
-            rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Phenol(pred)", "k": k_phenol_pred, "tR": tr_from_k(k_phenol_pred, t0_use), "note": "from A and Nitrobenzene"})
-
-            alpha_B = alphas["B"]
-            k_aniline = alpha_B * k_nitro_meas
-            k_aniline = clip_k_if_needed(k_aniline, "Aniline", clip_enabled)
-            rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Aniline", "k": k_aniline, "tR": tr_from_k(k_aniline, t0_use), "note": "from B and Nitrobenzene"})
+    if not per_sample:
+        # choose grouping: prefer condition+r+s if present
+        if {"r", "s"}.issubset(set(ind_df.columns)):
+            group_keys = ["condition", "r", "s"]
         else:
-            if len(phenol_row) > 0:
+            group_keys = ["condition"]
+        groups = ind_df.groupby(group_keys)
+        rows = []
+
+        for group_key, g in groups:
+            if len(group_keys) == 3:
+                cond, r_val, s_val = group_key
+            else:
+                cond = group_key
+                r_val = None
+                s_val = None
+
+            mean = g[["H", "S", "A", "B_indicator", "C"]].mean()
+            mean_dict: Dict[str, float] = {
+                "H": float(mean["H"]),
+                "S": float(mean["S"]),
+                "A": float(mean["A"]),
+                "B": float(mean["B_indicator"]),
+                "C": float(mean["C"]),
+            }
+
+            # estimate or find baseline k for this condition,r,s
+            k_base = None
+            t0_use = float(args.t0)
+            note_base = ""
+            if base_df is not None:
+                k_est, t0_est, src = estimate_baseline_k(
+                    base_df,
+                    args.baseline_compound,
+                    cond,
+                    r_val,
+                    s_val,
+                    args.t0,
+                    min_samples=args.fit_min_samples,
+                    use_log=not getattr(args, "no_log_fit", False),
+                    fit_global_if_sparse=getattr(args, "fit_global_if_sparse", False),
+                )
+                if k_est is not None:
+                    k_base = float(k_est)
+                    t0_use = float(t0_est)
+                    note_base = f"baseline({src})"
+
+            if k_base is None:
+                print(f"Warning: no baseline measurement for compound '{args.baseline_compound}' (condition={cond}, r={r_val}, s={s_val}); skipping", file=sys.stderr)
+                continue
+
+            tR_base = tr_from_k(k_base, t0_use)
+            rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": args.baseline_compound, "k": k_base, "tR": tR_base, "note": note_base})
+
+            # derive other compounds according to DEFAULT_MAPPING
+            # compute alphas from mean indicators using scale
+            alphas = {}
+            for ind_key in ["H", "S", "A", "B", "C"]:
+                alphas[ind_key] = float(mean_dict[ind_key]) * float(scales[ind_key])
+
+            # compute Ethyl/Toluene/1,2,4-TMB chain if baseline is Ethylbenzene
+            if args.baseline_compound == "Ethylbenzene":
+                alpha_H = max(alphas["H"], 1e-8)
+                k_toluene = k_base / alpha_H
+                k_toluene = clip_k_if_needed(k_toluene, "Toluene", clip_enabled)
+                rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Toluene", "k": k_toluene, "tR": tr_from_k(k_toluene, t0_use), "note": "from H"})
+
+                alpha_S = alphas["S"]
+                k_124TMB = alpha_S * k_base
+                k_124TMB = clip_k_if_needed(k_124TMB, "1,2,4-TMB", clip_enabled)
+                rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "1,2,4-TMB", "k": k_124TMB, "tR": tr_from_k(k_124TMB, t0_use), "note": "from S"})
+
+            # If baseline is Phenol, derive Nitrobenzene (and Aniline) and Benzylamine
+            if args.baseline_compound == "Phenol":
+                alpha_A = max(alphas["A"], 1e-8)
+                k_nitro = k_base / alpha_A
+                k_nitro = clip_k_if_needed(k_nitro, "Nitrobenzene", clip_enabled)
+                rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Nitrobenzene", "k": k_nitro, "tR": tr_from_k(k_nitro, t0_use), "note": "from A"})
+
+                alpha_B = alphas["B"]
+                k_aniline = alpha_B * k_nitro
+                k_aniline = clip_k_if_needed(k_aniline, "Aniline", clip_enabled)
+                rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Aniline", "k": k_aniline, "tR": tr_from_k(k_aniline, t0_use), "note": "from B and Nitrobenzene"})
+
+                alpha_C = alphas["C"]
+                k_benzyl = alpha_C * k_base
+                k_benzyl = clip_k_if_needed(k_benzyl, "Benzylamine", clip_enabled)
+                rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Benzylamine", "k": k_benzyl, "tR": tr_from_k(k_benzyl, t0_use), "note": "from C and Phenol baseline"})
+
+            # A/B chain: where Nitrobenzene or Phenol measured in baseline file for same condition, try to use them
+            nitro_row = base_df[(base_df["compound"] == "Nitrobenzene") & (base_df.get("condition", None) == cond)] if base_df is not None else pd.DataFrame()
+            phenol_row = base_df[(base_df["compound"] == "Phenol") & (base_df.get("condition", None) == cond)] if base_df is not None else pd.DataFrame()
+            if len(nitro_row) > 0 and len(phenol_row) > 0:
+                t0_n = float(nitro_row.iloc[0].get("t0", args.t0))
+                k_nitro_meas = k_from_tr(float(nitro_row.iloc[0]["tR"]), t0_n)
+                alpha_A = alphas["A"]
+                k_phenol_pred = alpha_A * k_nitro_meas
+                k_phenol_pred = clip_k_if_needed(k_phenol_pred, "Phenol", clip_enabled)
+                rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Phenol(pred)", "k": k_phenol_pred, "tR": tr_from_k(k_phenol_pred, t0_use), "note": "from A and Nitrobenzene"})
+
+                alpha_B = alphas["B"]
+                k_aniline = alpha_B * k_nitro_meas
+                k_aniline = clip_k_if_needed(k_aniline, "Aniline", clip_enabled)
+                rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Aniline", "k": k_aniline, "tR": tr_from_k(k_aniline, t0_use), "note": "from B and Nitrobenzene"})
+            else:
+                if len(phenol_row) > 0:
+                    t0_p = float(phenol_row.iloc[0].get("t0", args.t0))
+                    k_phenol_meas = k_from_tr(float(phenol_row.iloc[0]["tR"]), t0_p)
+                    alpha_A = max(alphas["A"], 1e-8)
+                    k_nitro_est = k_phenol_meas / alpha_A
+                    k_nitro_est = clip_k_if_needed(k_nitro_est, "Nitrobenzene", clip_enabled)
+                    rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Nitrobenzene(pred)", "k": k_nitro_est, "tR": tr_from_k(k_nitro_est, t0_use), "note": "inferred from Phenol and A"})
+                    alpha_B = alphas["B"]
+                    k_aniline = alpha_B * k_nitro_est
+                    k_aniline = clip_k_if_needed(k_aniline, "Aniline", clip_enabled)
+                    rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Aniline", "k": k_aniline, "tR": tr_from_k(k_aniline, t0_use), "note": "from B and inferred Nitro"})
+
+            # C chain: if Phenol exists in baseline for this condition, derive Benzylamine
+            if base_df is not None and len(phenol_row) > 0:
                 t0_p = float(phenol_row.iloc[0].get("t0", args.t0))
                 k_phenol_meas = k_from_tr(float(phenol_row.iloc[0]["tR"]), t0_p)
-                alpha_A = max(alphas["A"], 1e-8)
-                k_nitro_est = k_phenol_meas / alpha_A
-                k_nitro_est = clip_k_if_needed(k_nitro_est, "Nitrobenzene", clip_enabled)
-                rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Nitrobenzene(pred)", "k": k_nitro_est, "tR": tr_from_k(k_nitro_est, t0_use), "note": "inferred from Phenol and A"})
-                alpha_B = alphas["B"]
-                k_aniline = alpha_B * k_nitro_est
-                k_aniline = clip_k_if_needed(k_aniline, "Aniline", clip_enabled)
-                rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Aniline", "k": k_aniline, "tR": tr_from_k(k_aniline, t0_use), "note": "from B and inferred Nitro"})
+                alpha_C = alphas["C"]
+                k_benzyl = alpha_C * k_phenol_meas
+                k_benzyl = clip_k_if_needed(k_benzyl, "Benzylamine", clip_enabled)
+                rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Benzylamine", "k": k_benzyl, "tR": tr_from_k(k_benzyl, t0_use), "note": "from C and Phenol"})
 
-        # C chain: if Phenol exists in baseline for this condition, derive Benzylamine
-        if base_df is not None and len(phenol_row) > 0:
-            t0_p = float(phenol_row.iloc[0].get("t0", args.t0))
-            k_phenol_meas = k_from_tr(float(phenol_row.iloc[0]["tR"]), t0_p)
-            alpha_C = alphas["C"]
-            k_benzyl = alpha_C * k_phenol_meas
-            k_benzyl = clip_k_if_needed(k_benzyl, "Benzylamine", clip_enabled)
-            rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Benzylamine", "k": k_benzyl, "tR": tr_from_k(k_benzyl, t0_use), "note": "from C and Phenol"})
+    # scales convert 0..1 indicator into alpha; default 1.0 (user can supply)
+    scales = {"H": args.scale_H, "S": args.scale_S, "A": args.scale_A, "B": args.scale_B, "C": args.scale_C}
+
+    clip_enabled = not getattr(args, "no_clip", False)
+
+    if per_sample:
+        # iterate each input row and produce a prediction set for that sample
+        sample_id_col = getattr(args, "sample_id_col", None)
+        sample_outputs = {}
+        for idx, row in ind_df.iterrows():
+            cond = row.get("condition", None)
+            r_val = row.get("r", None) if "r" in row.index else None
+            s_val = row.get("s", None) if "s" in row.index else None
+
+            # determine sample id
+            if sample_id_col and sample_id_col in ind_df.columns:
+                sample_id = row[sample_id_col]
+            else:
+                sample_id = f"idx{idx}"
+
+            mean_dict = alphas_by_condition.get(cond, alphas_by_condition.get(None))
+            if mean_dict is None:
+                print(f"Warning: no indicators available for condition={cond}; skipping sample {sample_id}", file=sys.stderr)
+                continue
+
+            # estimate baseline for this sample using its r,s
+            k_base = None
+            t0_use = float(args.t0)
+            note_base = ""
+            if base_df is not None:
+                k_est, t0_est, src = estimate_baseline_k(
+                    base_df,
+                    args.baseline_compound,
+                    cond,
+                    r_val,
+                    s_val,
+                    args.t0,
+                    min_samples=args.fit_min_samples,
+                    use_log=not getattr(args, "no_log_fit", False),
+                    fit_global_if_sparse=getattr(args, "fit_global_if_sparse", False),
+                )
+                if k_est is not None:
+                    k_base = float(k_est)
+                    t0_use = float(t0_est)
+                    note_base = f"baseline({src})"
+
+            if k_base is None:
+                print(f"Warning: no baseline for sample {sample_id} (condition={cond}, r={r_val}, s={s_val}); skipping", file=sys.stderr)
+                continue
+
+            sample_rows = []
+            tR_base = tr_from_k(k_base, t0_use)
+            sample_rows.append({"sample_id": sample_id, "condition": cond, "r": r_val, "s": s_val, "compound": args.baseline_compound, "k": k_base, "tR": tR_base, "note": note_base})
+
+            # compute alphas from mean indicators using scale
+            alphas = {}
+            for ind_key in ["H", "S", "A", "B", "C"]:
+                alphas[ind_key] = float(mean_dict[ind_key]) * float(scales[ind_key])
+
+            # compute derived compounds (same logic as group-level)
+            if args.baseline_compound == "Ethylbenzene":
+                alpha_H = max(alphas["H"], 1e-8)
+                k_toluene = k_base / alpha_H
+                k_toluene = clip_k_if_needed(k_toluene, "Toluene", clip_enabled)
+                sample_rows.append({"sample_id": sample_id, "condition": cond, "r": r_val, "s": s_val, "compound": "Toluene", "k": k_toluene, "tR": tr_from_k(k_toluene, t0_use), "note": "from H"})
+
+                alpha_S = alphas["S"]
+                k_124TMB = alpha_S * k_base
+                k_124TMB = clip_k_if_needed(k_124TMB, "1,2,4-TMB", clip_enabled)
+                sample_rows.append({"sample_id": sample_id, "condition": cond, "r": r_val, "s": s_val, "compound": "1,2,4-TMB", "k": k_124TMB, "tR": tr_from_k(k_124TMB, t0_use), "note": "from S"})
+
+            if args.baseline_compound == "Phenol":
+                alpha_A = max(alphas["A"], 1e-8)
+                k_nitro = k_base / alpha_A
+                k_nitro = clip_k_if_needed(k_nitro, "Nitrobenzene", clip_enabled)
+                sample_rows.append({"sample_id": sample_id, "condition": cond, "r": r_val, "s": s_val, "compound": "Nitrobenzene", "k": k_nitro, "tR": tr_from_k(k_nitro, t0_use), "note": "from A"})
+
+                alpha_B = alphas["B"]
+                k_aniline = alpha_B * k_nitro
+                k_aniline = clip_k_if_needed(k_aniline, "Aniline", clip_enabled)
+                sample_rows.append({"sample_id": sample_id, "condition": cond, "r": r_val, "s": s_val, "compound": "Aniline", "k": k_aniline, "tR": tr_from_k(k_aniline, t0_use), "note": "from B and Nitrobenzene"})
+
+                alpha_C = alphas["C"]
+                k_benzyl = alpha_C * k_base
+                k_benzyl = clip_k_if_needed(k_benzyl, "Benzylamine", clip_enabled)
+                sample_rows.append({"sample_id": sample_id, "condition": cond, "r": r_val, "s": s_val, "compound": "Benzylamine", "k": k_benzyl, "tR": tr_from_k(k_benzyl, t0_use), "note": "from C and Phenol baseline"})
+
+            # A/B chain and phenol-based inferences (use base_df measurements if present)
+            nitro_row = base_df[(base_df["compound"] == "Nitrobenzene") & (base_df.get("condition", None) == cond)] if base_df is not None else pd.DataFrame()
+            phenol_row = base_df[(base_df["compound"] == "Phenol") & (base_df.get("condition", None) == cond)] if base_df is not None else pd.DataFrame()
+            if len(nitro_row) > 0 and len(phenol_row) > 0:
+                t0_n = float(nitro_row.iloc[0].get("t0", args.t0))
+                k_nitro_meas = k_from_tr(float(nitro_row.iloc[0]["tR"]), t0_n)
+                alpha_A = alphas["A"]
+                k_phenol_pred = alpha_A * k_nitro_meas
+                k_phenol_pred = clip_k_if_needed(k_phenol_pred, "Phenol", clip_enabled)
+                sample_rows.append({"sample_id": sample_id, "condition": cond, "r": r_val, "s": s_val, "compound": "Phenol(pred)", "k": k_phenol_pred, "tR": tr_from_k(k_phenol_pred, t0_use), "note": "from A and Nitrobenzene"})
+
+                alpha_B = alphas["B"]
+                k_aniline = alpha_B * k_nitro_meas
+                k_aniline = clip_k_if_needed(k_aniline, "Aniline", clip_enabled)
+                sample_rows.append({"sample_id": sample_id, "condition": cond, "r": r_val, "s": s_val, "compound": "Aniline", "k": k_aniline, "tR": tr_from_k(k_aniline, t0_use), "note": "from B and Nitrobenzene"})
+            else:
+                if len(phenol_row) > 0:
+                    t0_p = float(phenol_row.iloc[0].get("t0", args.t0))
+                    k_phenol_meas = k_from_tr(float(phenol_row.iloc[0]["tR"]), t0_p)
+                    alpha_A = max(alphas["A"], 1e-8)
+                    k_nitro_est = k_phenol_meas / alpha_A
+                    k_nitro_est = clip_k_if_needed(k_nitro_est, "Nitrobenzene", clip_enabled)
+                    sample_rows.append({"sample_id": sample_id, "condition": cond, "r": r_val, "s": s_val, "compound": "Nitrobenzene(pred)", "k": k_nitro_est, "tR": tr_from_k(k_nitro_est, t0_use), "note": "inferred from Phenol and A"})
+                    alpha_B = alphas["B"]
+                    k_aniline = alpha_B * k_nitro_est
+                    k_aniline = clip_k_if_needed(k_aniline, "Aniline", clip_enabled)
+                    sample_rows.append({"sample_id": sample_id, "condition": cond, "r": r_val, "s": s_val, "compound": "Aniline", "k": k_aniline, "tR": tr_from_k(k_aniline, t0_use), "note": "from B and inferred Nitro"})
+
+            if base_df is not None and len(phenol_row) > 0:
+                t0_p = float(phenol_row.iloc[0].get("t0", args.t0))
+                k_phenol_meas = k_from_tr(float(phenol_row.iloc[0]["tR"]), t0_p)
+                alpha_C = alphas["C"]
+                k_benzyl = alpha_C * k_phenol_meas
+                k_benzyl = clip_k_if_needed(k_benzyl, "Benzylamine", clip_enabled)
+                sample_rows.append({"sample_id": sample_id, "condition": cond, "r": r_val, "s": s_val, "compound": "Benzylamine", "k": k_benzyl, "tR": tr_from_k(k_benzyl, t0_use), "note": "from C and Phenol"})
+
+            sample_outputs[str(sample_id)] = pd.DataFrame(sample_rows)
+
+        return sample_outputs
 
     out = pd.DataFrame(rows)
     return out
@@ -343,15 +489,37 @@ def parse_args(argv=None):
     p.add_argument("--fit-min-samples", type=int, default=3, help="minimum samples required to fit r/s model per condition")
     p.add_argument("--no-log-fit", action="store_true", help="disable log-space fit for k' (fit k directly)")
     p.add_argument("--fit-global-if-sparse", action="store_true", help="allow global-fit across conditions when per-condition data sparse")
-    p.add_argument("--out", default="predicted_tr.csv", help="output CSV path")
+    p.add_argument("--out", default="predicted_tr.csv", help="output CSV path or directory when using --per-sample")
+    p.add_argument("--per-sample", action="store_true", help="write per-sample CSVs (one file per trial)")
+    p.add_argument("--sample-id-col", default=None, help="column name to use as sample id for per-sample outputs (default: row index)")
     return p.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
     out = predict(args)
-    out.to_csv(args.out, index=False)
-    print(f"Wrote predictions to: {args.out}")
+    if getattr(args, "per_sample", False):
+        # expect a dict of sample_id -> DataFrame
+        if not isinstance(out, dict):
+            print("Error: per-sample output requested but predictions not in expected format", file=sys.stderr)
+            return
+        out_path = Path(args.out)
+        if out_path.suffix == ".csv":
+            parent = out_path.parent
+            prefix = out_path.stem
+        else:
+            parent = out_path
+            prefix = "predicted"
+        parent.mkdir(parents=True, exist_ok=True)
+        for sid, df in out.items():
+            safe = str(sid).replace(os.sep, "_").replace(" ", "_")
+            fname = f"{prefix}_sample-{safe}.csv"
+            p = parent / fname
+            df.to_csv(p, index=False)
+        print(f"Wrote per-sample predictions to: {str(parent)}")
+    else:
+        out.to_csv(args.out, index=False)
+        print(f"Wrote predictions to: {args.out}")
 
 
 if __name__ == "__main__":
