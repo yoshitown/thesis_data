@@ -26,6 +26,7 @@ import argparse
 import sys
 import math
 import pandas as pd
+import numpy as np
 from typing import Dict, Any
 
 
@@ -85,12 +86,120 @@ def tr_from_k(k: float, t0: float) -> float:
     return t0 * (1.0 + k)
 
 
+def estimate_baseline_k(
+    base_df: pd.DataFrame,
+    compound: str,
+    cond: Any,
+    r_val: Any,
+    s_val: Any,
+    t0_default: float,
+    min_samples: int = 3,
+    use_log: bool = True,
+    fit_global_if_sparse: bool = False,
+) -> Any:
+    """Estimate baseline k' for given compound, condition and (r,s).
+
+    Returns tuple (k_est, t0_used, source) or (None, None, None) if not available.
+    """
+    if base_df is None or len(base_df) == 0:
+        return (None, None, None)
+
+    # select rows for the compound and condition
+    rows = base_df[base_df["compound"] == compound]
+    if "condition" in base_df.columns:
+        rows_cond = rows[rows.get("condition", None) == cond]
+    else:
+        rows_cond = rows
+
+    # try exact r/s match when available
+    exact = None
+    if r_val is not None and s_val is not None and "r" in rows_cond.columns and "s" in rows_cond.columns:
+        try:
+            cand = rows_cond.copy()
+            cand_r = cand["r"].astype(float)
+            cand_s = cand["s"].astype(float)
+            mask = np.isclose(cand_r.values, float(r_val)) & np.isclose(cand_s.values, float(s_val))
+            cand_exact = cand[mask]
+            if len(cand_exact) > 0:
+                exact = cand_exact.iloc[0]
+        except Exception:
+            exact = None
+
+    if exact is not None:
+        t0_use = float(exact.get("t0", t0_default))
+        k_val = k_from_tr(float(exact["tR"]), t0_use)
+        return (float(k_val), float(t0_use), "measured_exact")
+
+    # try fitting using rows from same condition
+    def try_fit(df_rows: pd.DataFrame):
+        # build arrays
+        ys = []
+        Rs = []
+        Ss = []
+        t0s = []
+        for _, r in df_rows.iterrows():
+            try:
+                t0_i = float(r.get("t0", t0_default))
+                k_i = k_from_tr(float(r["tR"]), t0_i)
+            except Exception:
+                continue
+            if not np.isfinite(k_i) or k_i <= 0:
+                continue
+            ys.append(np.log(k_i) if use_log else k_i)
+            Rs.append(float(r.get("r", np.nan)))
+            Ss.append(float(r.get("s", np.nan)))
+            t0s.append(t0_i)
+
+        if len(ys) < min_samples:
+            return (None, None)
+
+        X = np.column_stack([np.ones(len(Rs)), np.array(Rs), np.array(Ss)])
+        y = np.array(ys)
+        try:
+            coeffs, *_ = np.linalg.lstsq(X, y, rcond=None)
+            x_pred = np.array([1.0, float(r_val) if r_val is not None else 0.0, float(s_val) if s_val is not None else 0.0])
+            y_pred = float(x_pred.dot(coeffs))
+            k_pred = float(np.exp(y_pred)) if use_log else float(y_pred)
+            t0_use = float(np.mean(t0s)) if len(t0s) > 0 else t0_default
+            return (k_pred, t0_use)
+        except Exception:
+            return (None, None)
+
+    # attempt per-condition fit
+    if len(rows_cond) >= min_samples:
+        k_fit, t0_fit = try_fit(rows_cond)
+        if k_fit is not None:
+            return (k_fit, t0_fit, "fitted_condition")
+
+    # optional: try global fit across all conditions for this compound
+    if fit_global_if_sparse and len(rows) >= min_samples:
+        k_fit, t0_fit = try_fit(rows)
+        if k_fit is not None:
+            return (k_fit, t0_fit, "fitted_global")
+
+    # fallback: use any measured row for compound (first one)
+    if len(rows) > 0:
+        row0 = rows.iloc[0]
+        t0_use = float(row0.get("t0", t0_default))
+        try:
+            k_val = k_from_tr(float(row0["tR"]), t0_use)
+            return (float(k_val), float(t0_use), "measured_fallback")
+        except Exception:
+            return (None, None, None)
+
+    return (None, None, None)
+
+
 def predict(args: argparse.Namespace) -> pd.DataFrame:
     ind_df = read_indicators(Path(args.indicators))
     base_df = read_baseline(Path(args.baseline)) if args.baseline else None
 
-    # group by condition in indicators
-    groups = ind_df.groupby("condition")
+    # choose grouping: prefer condition+r+s if present
+    if {"r", "s"}.issubset(set(ind_df.columns)):
+        group_keys = ["condition", "r", "s"]
+    else:
+        group_keys = ["condition"]
+    groups = ind_df.groupby(group_keys)
 
     rows = []
 
@@ -98,9 +207,15 @@ def predict(args: argparse.Namespace) -> pd.DataFrame:
     scales = {"H": args.scale_H, "S": args.scale_S, "A": args.scale_A, "B": args.scale_B, "C": args.scale_C}
 
     clip_enabled = not getattr(args, "no_clip", False)
-    for cond, g in groups:
+    for group_key, g in groups:
+        if len(group_keys) == 3:
+            cond, r_val, s_val = group_key
+        else:
+            cond = group_key
+            r_val = None
+            s_val = None
+
         mean = g[["H", "S", "A", "B_indicator", "C"]].mean()
-        # canonicalize keys
         mean_dict: Dict[str, float] = {
             "H": float(mean["H"]),
             "S": float(mean["S"]),
@@ -109,27 +224,33 @@ def predict(args: argparse.Namespace) -> pd.DataFrame:
             "C": float(mean["C"]),
         }
 
-        # find baseline measurement for this condition
-        baseline_row = None
+        # estimate or find baseline k for this condition,r,s
+        k_base = None
+        t0_use = float(args.t0)
+        note_base = ""
         if base_df is not None:
-            # try exact condition match first
-            cand = base_df[(base_df["compound"] == args.baseline_compound) & (base_df.get("condition", None) == cond)]
-            if len(cand) == 0:
-                # fallback: any row with baseline compound
-                cand = base_df[base_df["compound"] == args.baseline_compound]
-            if len(cand) > 0:
-                baseline_row = cand.iloc[0]
+            k_est, t0_est, src = estimate_baseline_k(
+                base_df,
+                args.baseline_compound,
+                cond,
+                r_val,
+                s_val,
+                args.t0,
+                min_samples=args.fit_min_samples,
+                use_log=not getattr(args, "no_log_fit", False),
+                fit_global_if_sparse=getattr(args, "fit_global_if_sparse", False),
+            )
+            if k_est is not None:
+                k_base = float(k_est)
+                t0_use = float(t0_est)
+                note_base = f"baseline({src})"
 
-        if baseline_row is None:
-            print(f"Warning: no baseline measurement for compound '{args.baseline_compound}' (condition={cond}); skipping condition", file=sys.stderr)
+        if k_base is None:
+            print(f"Warning: no baseline measurement for compound '{args.baseline_compound}' (condition={cond}, r={r_val}, s={s_val}); skipping", file=sys.stderr)
             continue
 
-        t0_use = float(baseline_row.get("t0", args.t0))
-        tR_base = float(baseline_row["tR"])
-        k_base = k_from_tr(tR_base, t0_use)
-
-        # store baseline
-        rows.append({"condition": cond, "compound": args.baseline_compound, "k": k_base, "tR": tR_base, "note": "baseline"})
+        tR_base = tr_from_k(k_base, t0_use)
+        rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": args.baseline_compound, "k": k_base, "tR": tR_base, "note": note_base})
 
         # derive other compounds according to DEFAULT_MAPPING
         # compute alphas from mean indicators using scale
@@ -139,83 +260,69 @@ def predict(args: argparse.Namespace) -> pd.DataFrame:
 
         # compute Ethyl/Toluene/1,2,4-TMB chain if baseline is Ethylbenzene
         if args.baseline_compound == "Ethylbenzene":
-            # H: alpha_H = k(Ethyl)/k(Toluene) => k(Toluene) = k(Ethyl) / alpha_H
             alpha_H = max(alphas["H"], 1e-8)
             k_toluene = k_base / alpha_H
             k_toluene = clip_k_if_needed(k_toluene, "Toluene", clip_enabled)
-            rows.append({"condition": cond, "compound": "Toluene", "k": k_toluene, "tR": tr_from_k(k_toluene, t0_use), "note": "from H"})
+            rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Toluene", "k": k_toluene, "tR": tr_from_k(k_toluene, t0_use), "note": "from H"})
 
-            # S: alpha_S = k(1,2,4-TMB)/k(Ethyl) => k(1,2,4-TMB) = alpha_S * k(Ethyl)
             alpha_S = alphas["S"]
             k_124TMB = alpha_S * k_base
             k_124TMB = clip_k_if_needed(k_124TMB, "1,2,4-TMB", clip_enabled)
-            rows.append({"condition": cond, "compound": "1,2,4-TMB", "k": k_124TMB, "tR": tr_from_k(k_124TMB, t0_use), "note": "from S"})
+            rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "1,2,4-TMB", "k": k_124TMB, "tR": tr_from_k(k_124TMB, t0_use), "note": "from S"})
 
         # If baseline is Phenol, derive Nitrobenzene (and Aniline) and Benzylamine
         if args.baseline_compound == "Phenol":
-            # k_base is k(Phenol)
-            # A: alpha_A = k(Phenol) / k(Nitrobenzene) => k(Nitrobenzene) = k(Phenol) / alpha_A
             alpha_A = max(alphas["A"], 1e-8)
             k_nitro = k_base / alpha_A
             k_nitro = clip_k_if_needed(k_nitro, "Nitrobenzene", clip_enabled)
-            rows.append({"condition": cond, "compound": "Nitrobenzene", "k": k_nitro, "tR": tr_from_k(k_nitro, t0_use), "note": "from A"})
+            rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Nitrobenzene", "k": k_nitro, "tR": tr_from_k(k_nitro, t0_use), "note": "from A"})
 
-            # B: alpha_B = k(Aniline) / k(Nitrobenzene) => k(Aniline) = alpha_B * k_nitro
             alpha_B = alphas["B"]
             k_aniline = alpha_B * k_nitro
             k_aniline = clip_k_if_needed(k_aniline, "Aniline", clip_enabled)
-            rows.append({"condition": cond, "compound": "Aniline", "k": k_aniline, "tR": tr_from_k(k_aniline, t0_use), "note": "from B and Nitrobenzene"})
+            rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Aniline", "k": k_aniline, "tR": tr_from_k(k_aniline, t0_use), "note": "from B and Nitrobenzene"})
 
-            # C: alpha_C = k(Benzylamine) / k(Phenol) => k(Benzylamine) = alpha_C * k(Phenol)
             alpha_C = alphas["C"]
             k_benzyl = alpha_C * k_base
             k_benzyl = clip_k_if_needed(k_benzyl, "Benzylamine", clip_enabled)
-            rows.append({"condition": cond, "compound": "Benzylamine", "k": k_benzyl, "tR": tr_from_k(k_benzyl, t0_use), "note": "from C and Phenol baseline"})
+            rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Benzylamine", "k": k_benzyl, "tR": tr_from_k(k_benzyl, t0_use), "note": "from C and Phenol baseline"})
 
-        # A/B chain requires Phenol/Nitrobenzene
-        # If baseline file contains Phenol or Nitrobenzene, use them; else skip
-        # A: alpha_A = k(Phenol)/k(Nitrobenzene)
-        # B: alpha_B = k(Aniline)/k(Nitrobenzene)
+        # A/B chain: where Nitrobenzene or Phenol measured in baseline file for same condition, try to use them
         nitro_row = base_df[(base_df["compound"] == "Nitrobenzene") & (base_df.get("condition", None) == cond)] if base_df is not None else pd.DataFrame()
         phenol_row = base_df[(base_df["compound"] == "Phenol") & (base_df.get("condition", None) == cond)] if base_df is not None else pd.DataFrame()
         if len(nitro_row) > 0 and len(phenol_row) > 0:
             t0_n = float(nitro_row.iloc[0].get("t0", args.t0))
-            k_nitro = k_from_tr(float(nitro_row.iloc[0]["tR"]), t0_n)
-            # from A: k_phenol = alpha_A * k_nitro
+            k_nitro_meas = k_from_tr(float(nitro_row.iloc[0]["tR"]), t0_n)
             alpha_A = alphas["A"]
-            k_phenol = alpha_A * k_nitro
-            k_phenol = clip_k_if_needed(k_phenol, "Phenol", clip_enabled)
-            rows.append({"condition": cond, "compound": "Phenol(pred)", "k": k_phenol, "tR": tr_from_k(k_phenol, t0_use), "note": "from A and Nitrobenzene"})
-            # from B: k_aniline = alpha_B * k_nitro
+            k_phenol_pred = alpha_A * k_nitro_meas
+            k_phenol_pred = clip_k_if_needed(k_phenol_pred, "Phenol", clip_enabled)
+            rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Phenol(pred)", "k": k_phenol_pred, "tR": tr_from_k(k_phenol_pred, t0_use), "note": "from A and Nitrobenzene"})
+
             alpha_B = alphas["B"]
-            k_aniline = alpha_B * k_nitro
+            k_aniline = alpha_B * k_nitro_meas
             k_aniline = clip_k_if_needed(k_aniline, "Aniline", clip_enabled)
-            rows.append({"condition": cond, "compound": "Aniline", "k": k_aniline, "tR": tr_from_k(k_aniline, t0_use), "note": "from B and Nitrobenzene"})
+            rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Aniline", "k": k_aniline, "tR": tr_from_k(k_aniline, t0_use), "note": "from B and Nitrobenzene"})
         else:
-            # try alternative: if phenol present but nitro missing, derive nitro from phenol/alpha
             if len(phenol_row) > 0:
                 t0_p = float(phenol_row.iloc[0].get("t0", args.t0))
                 k_phenol_meas = k_from_tr(float(phenol_row.iloc[0]["tR"]), t0_p)
-                # alpha_A = k_phenol / k_nitro => k_nitro = k_phenol / alpha_A
                 alpha_A = max(alphas["A"], 1e-8)
                 k_nitro_est = k_phenol_meas / alpha_A
                 k_nitro_est = clip_k_if_needed(k_nitro_est, "Nitrobenzene", clip_enabled)
-                rows.append({"condition": cond, "compound": "Nitrobenzene(pred)", "k": k_nitro_est, "tR": tr_from_k(k_nitro_est, t0_use), "note": "inferred from Phenol and A"})
-                # then Aniline from alpha_B
+                rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Nitrobenzene(pred)", "k": k_nitro_est, "tR": tr_from_k(k_nitro_est, t0_use), "note": "inferred from Phenol and A"})
                 alpha_B = alphas["B"]
                 k_aniline = alpha_B * k_nitro_est
                 k_aniline = clip_k_if_needed(k_aniline, "Aniline", clip_enabled)
-                rows.append({"condition": cond, "compound": "Aniline", "k": k_aniline, "tR": tr_from_k(k_aniline, t0_use), "note": "from B and inferred Nitro"})
+                rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Aniline", "k": k_aniline, "tR": tr_from_k(k_aniline, t0_use), "note": "from B and inferred Nitro"})
 
-        # C chain: alpha_C = k(Benzylamine)/k(Phenol)
-        # if Phenol exists in baseline, use measured; else skip
+        # C chain: if Phenol exists in baseline for this condition, derive Benzylamine
         if base_df is not None and len(phenol_row) > 0:
             t0_p = float(phenol_row.iloc[0].get("t0", args.t0))
             k_phenol_meas = k_from_tr(float(phenol_row.iloc[0]["tR"]), t0_p)
             alpha_C = alphas["C"]
             k_benzyl = alpha_C * k_phenol_meas
             k_benzyl = clip_k_if_needed(k_benzyl, "Benzylamine", clip_enabled)
-            rows.append({"condition": cond, "compound": "Benzylamine", "k": k_benzyl, "tR": tr_from_k(k_benzyl, t0_use), "note": "from C and Phenol"})
+            rows.append({"condition": cond, "r": r_val, "s": s_val, "compound": "Benzylamine", "k": k_benzyl, "tR": tr_from_k(k_benzyl, t0_use), "note": "from C and Phenol"})
 
     out = pd.DataFrame(rows)
     return out
@@ -233,6 +340,9 @@ def parse_args(argv=None):
     p.add_argument("--scale-B", type=float, default=1.0, help="scale factor to convert B indicator to alpha_B")
     p.add_argument("--scale-C", type=float, default=1.0, help="scale factor to convert C indicator to alpha_C")
     p.add_argument("--no-clip", action="store_true", help="disable clipping of predicted k' to typical ranges")
+    p.add_argument("--fit-min-samples", type=int, default=3, help="minimum samples required to fit r/s model per condition")
+    p.add_argument("--no-log-fit", action="store_true", help="disable log-space fit for k' (fit k directly)")
+    p.add_argument("--fit-global-if-sparse", action="store_true", help="allow global-fit across conditions when per-condition data sparse")
     p.add_argument("--out", default="predicted_tr.csv", help="output CSV path")
     return p.parse_args(argv)
 
