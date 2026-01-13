@@ -1,41 +1,41 @@
 condition,compound,k,tR,note
-1,Phenol,0.19999999999999996,1.2,baseline
-1,Nitrobenzene,2.0,3.0,from A
-1,Aniline,2.9124008372251757,3.9124008372251757,from B and Nitrobenzene
-1,Benzylamine,0.3479884196207703,1.3479884196207703,from C and Phenol baseline
-2,Phenol,0.19999999999999996,1.2,baseline
-2,Nitrobenzene,2.0,3.0,from A
-2,Aniline,3.1287034162825154,4.128703416282516,from B and Nitrobenzene
-2,Benzylamine,0.40102757074441964,1.4010275707444197,from C and Phenol baseline
-3,Phenol,0.19999999999999996,1.2,baseline
-3,Nitrobenzene,2.0,3.0,from A
-3,Aniline,3.0721891368963505,4.07218913689635,from B and Nitrobenzene
-3,Benzylamine,0.366131697853604,1.366131697853604,from C and Phenol baseline
-4,Phenol,0.19999999999999996,1.2,baseline
-4,Nitrobenzene,2.0,3.0,from A
-4,Aniline,3.171675320769225,4.171675320769225,from B and Nitrobenzene
-4,Benzylamine,0.35977773894990583,1.359777738949906,from C and Phenol baseline
-5,Phenol,0.19999999999999996,1.2,baseline
-5,Nitrobenzene,2.0,3.0,from A
-5,Aniline,2.7682664628802827,3.7682664628802827,from B and Nitrobenzene
-5,Benzylamine,0.34808149315152276,1.3480814931515228,from C and Phenol baseline
-6,Phenol,0.19999999999999996,1.2,baseline
-6,Nitrobenzene,2.0,3.0,from A
-6,Aniline,2.9059124360402664,3.9059124360402664,from B and Nitrobenzene
-6,Benzylamine,0.3203694423704318,1.3203694423704317,from C and Phenol baseline
-7,Phenol,0.19999999999999996,1.2,baseline
-7,Nitrobenzene,2.0,3.0,from A
-7,Aniline,3.127914991646694,4.127914991646694,from B and Nitrobenzene
-7,Benzylamine,0.39101893916045,1.39101893916045,from C and Phenol baseline
-8,Phenol,0.19999999999999996,1.2,baseline
-8,Nitrobenzene,2.0,3.0,from A
-8,Aniline,2.7681071927381944,3.7681071927381944,from B and Nitrobenzene
-8,Benzylamine,0.3259585636461861,1.3259585636461861,from C and Phenol baseline
-9,Phenol,0.19999999999999996,1.2,baseline
-9,Nitrobenzene,2.0,3.0,from A
-9,Aniline,2.649308550717365,3.649308550717365,from B and Nitrobenzene
-9,Benzylamine,0.3043904043255987,1.3043904043255987,from C and Phenol baseline
-10,Phenol,0.19999999999999996,1.2,baseline
-10,Nitrobenzene,2.0,3.0,from A
-10,Aniline,3.032453392200558,4.0324533922005585,from B and Nitrobenzene
-10,Benzylamine,0.3044993916330601,1.30449939163306,from C and Phenol baseline
+1,Phenol,-0.6,1.2,baseline
+1,Nitrobenzene,2.0,9.0,from A
+1,Aniline,2.9124008372251757,11.737202511675527,from B and Nitrobenzene
+1,Benzylamine,-1.0439652588623112,-0.13189577658693352,from C and Phenol baseline
+2,Phenol,-0.6,1.2,baseline
+2,Nitrobenzene,2.0,9.0,from A
+2,Aniline,3.1287034162825154,12.386110248847547,from B and Nitrobenzene
+2,Benzylamine,-1.2030827122332592,-0.6092481366997777,from C and Phenol baseline
+3,Phenol,-0.6,1.2,baseline
+3,Nitrobenzene,2.0,9.0,from A
+3,Aniline,3.0721891368963505,12.21656741068905,from B and Nitrobenzene
+3,Benzylamine,-1.0983950935608122,-0.29518528068243666,from C and Phenol baseline
+4,Phenol,-0.6,1.2,baseline
+4,Nitrobenzene,2.0,9.0,from A
+4,Aniline,3.171675320769225,12.515025962307675,from B and Nitrobenzene
+4,Benzylamine,-1.0793332168497176,-0.23799965054915284,from C and Phenol baseline
+5,Phenol,-0.6,1.2,baseline
+5,Nitrobenzene,2.0,9.0,from A
+5,Aniline,2.7682664628802827,11.304799388640848,from B and Nitrobenzene
+5,Benzylamine,-1.0442444794545684,-0.13273343836370533,from C and Phenol baseline
+6,Phenol,-0.6,1.2,baseline
+6,Nitrobenzene,2.0,9.0,from A
+6,Aniline,2.9059124360402664,11.7177373081208,from B and Nitrobenzene
+6,Benzylamine,-0.9611083271112956,0.1166750186661133,from C and Phenol baseline
+7,Phenol,-0.6,1.2,baseline
+7,Nitrobenzene,2.0,9.0,from A
+7,Aniline,3.127914991646694,12.383744974940083,from B and Nitrobenzene
+7,Benzylamine,-1.1730568174813503,-0.5191704524440508,from C and Phenol baseline
+8,Phenol,-0.6,1.2,baseline
+8,Nitrobenzene,2.0,9.0,from A
+8,Aniline,2.7681071927381944,11.304321578214584,from B and Nitrobenzene
+8,Benzylamine,-0.9778756909385585,0.06637292718432442,from C and Phenol baseline
+9,Phenol,-0.6,1.2,baseline
+9,Nitrobenzene,2.0,9.0,from A
+9,Aniline,2.649308550717365,10.947925652152096,from B and Nitrobenzene
+9,Benzylamine,-0.9131712129767964,0.26048636106961087,from C and Phenol baseline
+10,Phenol,-0.6,1.2,baseline
+10,Nitrobenzene,2.0,9.0,from A
+10,Aniline,3.032453392200558,12.097360176601676,from B and Nitrobenzene
+10,Benzylamine,-0.9134981748991805,0.2595054753024585,from C and Phenol baseline
