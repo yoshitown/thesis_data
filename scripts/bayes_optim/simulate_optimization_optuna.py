@@ -2,9 +2,10 @@ import os
 import sys
 import numpy as np
 import pandas as pd
-import optuna
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel
+from scipy.stats import norm
+from scipy.optimize import minimize
 import warnings
 
 # Path setup to import from src
@@ -48,101 +49,92 @@ def main():
         # Fallback: if GP training fails, set gp to None and skip predictions
         gp = None
     
-    # 3. Optimization Loop using Optuna
+    # 3. Optimization Loop using GP + EI (optimize acquisition with L-BFGS-B)
     n_iterations = 5
-    print(f"\n--- Starting Optuna Optimization Loop ({n_iterations} iterations) ---")
+    print(f"\n--- Starting GP+EI Optimization Loop ({n_iterations} iterations) ---")
 
-    # Define the objective function for Optuna
-    def objective(trial):
-        # In this simulation, we want Optuna to suggest (r, s)
-        # Optuna usually optimizes continuous spaces, but we only have discrete points.
-        # Approach: Allow Optuna to suggest continuous r, s, then map to nearest available point.
-        # Alternatively, since we want to pick FROM the candidates, we can ask Optuna 
-        # to pick an INDEX, but standard Optuna bayes optimization works best on continuous parameters.
-        # 
-        # Better Approach for "Discrete" selection with standard TPE/GP in Optuna:
-        # Suggest r and s in their min-max range.
-        # Find nearest point in *unobserved* candidates.
-        # Return that point's B_score.
-        # 
-        # HOWEVER, the user wants us to "propose a point" -> "return true value".
-        # We need to actively manage the 'observed' set outside the objective function 
-        # or use `study.ask()` interface for manual loop control.
-        # The `study.ask()` interface is perfect for "Human-in-the-loop" or simulation styles.
-        
-        # We will use the imperative "Ask-and-Tell" interface.
-        pass 
+    # Aggregate duplicate (r,s) points by mean to get unique design
+    df_unique = df.groupby(['r', 's'], as_index=False).agg({'B_score': 'mean'})
+    X_unique = df_unique[['r', 's']].values
+    y_unique = df_unique['B_score'].values
 
-    # We use Gaussian Process sampler to match the previous logic's intent (though TPE is default)
-    # Optuna's GP support comes via `optuna.integration.BoTorchSampler` or standard `TPESampler`.
-    # Based on the user request to "use optuna", TPE is standard, but if they want GP explicitly
-    # we would need BoTorch. Given successful install of just 'optuna' and 'scikit-learn',
-    # we will stick to default TPE or use skopt integration if available. 
-    # Let's use standard Optuna TPE sampler which is robust.
-    
-    # Note: If we really want GP, we need `botorch` (which failed to install on py3.8). 
-    # So we will use default Optuna sampler (TPE). It is also a statistical model (Bayesian).
-    sampler = optuna.samplers.TPESampler(seed=42)
-    study = optuna.create_study(direction="maximize", sampler=sampler)
+    # Start with the unique dataset
+    X_train = X_unique.copy()
+    y_train = y_unique.copy()
 
-    # Pre-populate study with initial random points
-    for idx in observed_indices:
-        study.add_trial(
-            optuna.trial.create_trial(
-                params={"r": X_all[idx, 0], "s": X_all[idx, 1]},
-                value=y_all[idx],
-                distributions={
-                    "r": optuna.distributions.FloatDistribution(0.6, 0.8), # Approx range
-                    "s": optuna.distributions.FloatDistribution(0.1, 0.5)
-                }
-            )
-        )
+    # Bounds for optimization
+    bounds = [(float(X_all[:, 0].min()), float(X_all[:, 0].max())),
+              (float(X_all[:, 1].min()), float(X_all[:, 1].max()))]
 
-    r_min, r_max = X_all[:, 0].min(), X_all[:, 0].max()
-    s_min, s_max = X_all[:, 1].min(), X_all[:, 1].max()
+    def expected_improvement(x, gp, y_best, xi=0.0):
+        x = np.atleast_2d(x)
+        mu, sigma = gp.predict(x, return_std=True)
+        sigma = sigma.reshape(-1)
+        mu = mu.reshape(-1)
+        with np.errstate(divide='warn'):
+            imp = mu - y_best - xi
+            Z = imp / sigma
+            ei = imp * norm.cdf(Z) + sigma * norm.pdf(Z)
+            ei[sigma == 0.0] = 0.0
+        return ei
+
+    def propose_location(gp, bounds, n_restarts=10):
+        dim = 2
+        best_x = None
+        best_acq = -np.inf
+
+        def min_obj(x):
+            # negative EI for minimizer
+            return -expected_improvement(x.reshape(1, -1), gp, y_train.max())[0]
+
+        # multiple random restarts
+        for _ in range(n_restarts):
+            x0 = np.array([np.random.uniform(b[0], b[1]) for b in bounds])
+            res = minimize(min_obj, x0=x0, bounds=bounds, method='L-BFGS-B')
+            if not res.success:
+                continue
+            acq_val = -res.fun
+            if acq_val > best_acq:
+                best_acq = acq_val
+                best_x = res.x
+
+        # fallback: grid search over unique points if optimizer failed
+        if best_x is None:
+            ei_vals = expected_improvement(X_unique, gp, y_train.max())
+            idx = int(np.argmax(ei_vals))
+            return X_unique[idx]
+
+        return best_x
 
     for i in range(n_iterations):
-        # 1. Ask Optuna for parameters
-        trial = study.ask(fixed_distributions={
-            "r": optuna.distributions.FloatDistribution(r_min, r_max),
-            "s": optuna.distributions.FloatDistribution(s_min, s_max)
-        })
-        
-        r_suggested = trial.params['r']
-        s_suggested = trial.params['s']
-        print(f"\nIteration {i+1}:")
-        print(f"  Optuna Suggested: r={r_suggested:.4f}, s={s_suggested:.4f}")
+        # Train GP on current observations
+        kernel = RBF(length_scale=0.3) + WhiteKernel(noise_level=1e-4)
+        gp_loop = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5)
+        gp_loop.fit(X_train, y_train)
 
-        # Show GP estimate if available
-        if gp is not None:
-            try:
-                mean, std = gp.predict(np.array([[r_suggested, s_suggested]]), return_std=True)
-                print(f"  GP estimate -> mean={mean[0]:.4f}, std={std[0]:.4f}")
-            except Exception:
-                print("  GP prediction unavailable.")
-        else:
-            print("  No GP model available for prediction.")
+        # Propose next point by maximizing EI
+        x_next = propose_location(gp_loop, bounds, n_restarts=20)
 
-        # Interactive Input: ask user for the true B_score
-        while True:
-            try:
-                user_input = input(f"  Enter true B_score for r={r_suggested:.4f}, s={s_suggested:.4f}: ")
-                y_actual = float(user_input)
-                break
-            except ValueError:
-                print("  Invalid input. Please enter a valid number.")
-        
-        # 3. "Tell" Optuna the result
-        study.tell(trial, y_actual)
-        
-        # Update observed (For consistency with previous logic, though strictly not needed for Optuna if we don't care about CSV matching)
-        # We can add a dummy index or just skip the CSV tracking part since this is manual input now.
-        # But to keep the "best observed" logic at the end working if possible, we'll just track the value.
-        
-    # Final Recap
+        # Show GP estimate at proposed point
+        mu, sigma = gp_loop.predict(np.atleast_2d(x_next), return_std=True)
+        print(f"\nIteration {i+1} Proposed (continuous): r={x_next[0]:.4f}, s={x_next[1]:.4f}")
+        print(f"  GP estimate -> mean={mu[0]:.4f}, std={sigma[0]:.4f}")
+
+        # Map to nearest available unique CSV point to get true B_score
+        dists = np.sum((X_unique - x_next) ** 2, axis=1)
+        nearest_idx = int(np.argmin(dists))
+        true_x = X_unique[nearest_idx]
+        true_y = y_unique[nearest_idx]
+        print(f"  Nearest CSV point: r={true_x[0]:.2f}, s={true_x[1]:.2f} -> true B_score={true_y:.4f}")
+
+        # Add observation and continue
+        X_train = np.vstack([X_train, true_x])
+        y_train = np.concatenate([y_train, [true_y]])
+
+    # Final result
+    best_idx = int(np.argmax(y_train))
     print(f"\n--- Optimization Finished ---")
-    print(f"Best trial value: {study.best_value:.4f}")
-    print(f"Best trial params: {study.best_params}")
+    print(f"Best observed in training set: r={X_train[best_idx,0]:.2f}, s={X_train[best_idx,1]:.2f} -> B_score={y_train[best_idx]:.4f}")
 
 if __name__ == "__main__":
     main()
