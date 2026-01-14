@@ -38,6 +38,15 @@ def main():
     
     print(f"--- Initialization ---")
     print(f"Loading all {len(observed_indices)} points from CSV as initial data.")
+    # Train a Gaussian Process on all available CSV data to provide a prediction
+    # (this model is only used to show an estimated B_score before asking for true value)
+    kernel = RBF(length_scale=0.3) + WhiteKernel(noise_level=1e-2)
+    gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=3)
+    try:
+        gp.fit(X_all, y_all)
+    except Exception:
+        # Fallback: if GP training fails, set gp to None and skip predictions
+        gp = None
     
     # 3. Optimization Loop using Optuna
     n_iterations = 5
@@ -101,11 +110,20 @@ def main():
         
         r_suggested = trial.params['r']
         s_suggested = trial.params['s']
-        
         print(f"\nIteration {i+1}:")
         print(f"  Optuna Suggested: r={r_suggested:.4f}, s={s_suggested:.4f}")
 
-        # Interactive Input
+        # Show GP estimate if available
+        if gp is not None:
+            try:
+                mean, std = gp.predict(np.array([[r_suggested, s_suggested]]), return_std=True)
+                print(f"  GP estimate -> mean={mean[0]:.4f}, std={std[0]:.4f}")
+            except Exception:
+                print("  GP prediction unavailable.")
+        else:
+            print("  No GP model available for prediction.")
+
+        # Interactive Input: ask user for the true B_score
         while True:
             try:
                 user_input = input(f"  Enter true B_score for r={r_suggested:.4f}, s={s_suggested:.4f}: ")
