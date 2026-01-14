@@ -87,3 +87,18 @@ def gradient_ascent_on_gp(
         Bvals.append(float(gp.predict(np.array([[s]]))[0]))
 
     return trajectory, Bvals
+
+
+def suggest_next_point_discrete(
+    gp: GaussianProcessRegressor,
+    X_candidates: np.ndarray,
+    beta: float = 1.96
+) -> int:
+    """Suggest the next point to query from a discrete set of candidates using UCB.
+
+    X_candidates: shape (N, D)
+    Returns the index of the suggested point in X_candidates.
+    """
+    mean, std = gp.predict(X_candidates, return_std=True)
+    ucb = mean + beta * std
+    return int(np.argmax(ucb))
