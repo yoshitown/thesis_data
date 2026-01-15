@@ -53,14 +53,13 @@ def main():
     n_iterations = 5
     print(f"\n--- Starting GP+EI Optimization Loop ({n_iterations} iterations) ---")
 
-    # Aggregate duplicate (r,s) points by mean to get unique design
-    df_unique = df.groupby(['r', 's'], as_index=False).agg({'B_score': 'mean'})
-    X_unique = df_unique[['r', 's']].values
-    y_unique = df_unique['B_score'].values
+    # Use raw individual trial data (do not aggregate duplicates)
+    X_candidates = X_all
+    y_candidates = y_all
 
-    # Start with the unique dataset
-    X_train = X_unique.copy()
-    y_train = y_unique.copy()
+    # Start training data with all individual observations
+    X_train = X_candidates.copy()
+    y_train = y_candidates.copy()
 
     # Bounds for optimization
     bounds = [(float(X_all[:, 0].min()), float(X_all[:, 0].max())),
@@ -98,11 +97,11 @@ def main():
                 best_acq = acq_val
                 best_x = res.x
 
-        # fallback: grid search over unique points if optimizer failed
+        # fallback: grid search over candidate points if optimizer failed
         if best_x is None:
-            ei_vals = expected_improvement(X_unique, gp, y_train.max())
+            ei_vals = expected_improvement(X_candidates, gp, y_train.max())
             idx = int(np.argmax(ei_vals))
-            return X_unique[idx]
+            return X_candidates[idx]
 
         return best_x
 
@@ -120,11 +119,11 @@ def main():
         print(f"\nIteration {i+1} Proposed (continuous): r={x_next[0]:.4f}, s={x_next[1]:.4f}")
         print(f"  GP estimate -> mean={mu[0]:.4f}, std={sigma[0]:.4f}")
 
-        # Map to nearest available unique CSV point to get true B_score
-        dists = np.sum((X_unique - x_next) ** 2, axis=1)
+        # Map to nearest available CSV row (individual trial) to get true B_score
+        dists = np.sum((X_candidates - x_next) ** 2, axis=1)
         nearest_idx = int(np.argmin(dists))
-        true_x = X_unique[nearest_idx]
-        true_y = y_unique[nearest_idx]
+        true_x = X_candidates[nearest_idx]
+        true_y = y_candidates[nearest_idx]
         print(f"  Nearest CSV point: r={true_x[0]:.2f}, s={true_x[1]:.2f} -> true B_score={true_y:.4f}")
 
         # Add observation and continue
