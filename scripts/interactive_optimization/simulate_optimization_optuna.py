@@ -119,16 +119,22 @@ def main():
         print(f"\nIteration {i+1} Proposed (continuous): r={x_next[0]:.4f}, s={x_next[1]:.4f}")
         print(f"  GP estimate -> mean={mu[0]:.4f}, std={sigma[0]:.4f}")
 
-        # Map to nearest available CSV row (individual trial) to get true B_score
-        dists = np.sum((X_candidates - x_next) ** 2, axis=1)
-        nearest_idx = int(np.argmin(dists))
-        true_x = X_candidates[nearest_idx]
-        true_y = y_candidates[nearest_idx]
-        print(f"  Nearest CSV point: r={true_x[0]:.2f}, s={true_x[1]:.2f} -> true B_score={true_y:.4f}")
+        # Use the continuous proposal directly as the suggested experimental condition
+        suggested_x = x_next
+        print(f"  Suggested experimental condition (continuous): r={suggested_x[0]:.4f}, s={suggested_x[1]:.4f}")
 
-        # Add observation and continue
-        X_train = np.vstack([X_train, true_x])
-        y_train = np.concatenate([y_train, [true_y]])
+        # Prompt user to run the experiment at the continuous condition and input measured B_score
+        while True:
+            try:
+                user_input = input(f"  Enter measured B_score for r={suggested_x[0]:.4f}, s={suggested_x[1]:.4f}: ")
+                measured_y = float(user_input)
+                break
+            except ValueError:
+                print("  Invalid input. Please enter a numeric B_score (e.g., 0.62).")
+
+        # Add the user-provided observation and continue
+        X_train = np.vstack([X_train, suggested_x])
+        y_train = np.concatenate([y_train, [measured_y]])
 
     # Final result
     best_idx = int(np.argmax(y_train))
