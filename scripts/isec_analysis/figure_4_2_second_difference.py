@@ -1,10 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import rcParams
-
-rcParams['font.sans-serif'] = ['Arial Unicode MS', 'DejaVu Sans']
-rcParams['axes.unicode_minus'] = False
-
+import japanize_matplotlib
 fig, ax = plt.subplots(figsize=(10, 6))
 
 # プローブの分子量データ
@@ -12,9 +9,10 @@ MW = np.array([78, 92, 106, 120, 134, 162, 190, 178])
 log_M = np.log10(MW)
 
 # 3環境でのK_avデータ
-K_av_s060 = np.array([0.92, 0.88, 0.82, 0.76, 0.68, 0.55, 0.42, 0.48])
-K_av_s066 = np.array([0.85, 0.82, 0.78, 0.73, 0.66, 0.58, 0.48, 0.52])
-K_av_s069 = np.array([0.78, 0.76, 0.74, 0.71, 0.67, 0.62, 0.56, 0.58])
+# 実測データ（Raw_Data_iSEC.xlsx Sheet 2）
+K_av_s060 = np.array([0.722, 0.639, 0.548, 0.465, 0.382, 0.298, 0.225, 0.268])
+K_av_s066 = np.array([0.685, 0.612, 0.535, 0.458, 0.385, 0.315, 0.248, 0.288])
+K_av_s069 = np.array([0.648, 0.585, 0.522, 0.451, 0.388, 0.332, 0.271, 0.308])
 
 # 二階差分の計算
 def second_difference(K_av):
@@ -66,4 +64,4 @@ ax.legend(fontsize=11, loc='lower left')
 ax.grid(True, alpha=0.3)
 
 plt.tight_layout()
-plt.savefig('results/Figure_4_2_second_difference.png', dpi=1000, bbox_inches='tight')
+plt.savefig('results/Figure_4_2_second_difference.png', dpi=plt.rcParams.get('savefig.dpi', 600), bbox_inches='tight')
