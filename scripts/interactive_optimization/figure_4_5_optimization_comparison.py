@@ -11,7 +11,7 @@ fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
 iterations = np.arange(1, 19)
 
 # ベイズ最適化の学習曲線（5回試行の平均±標準偏差）
-bo_mean = np.array([0.72, 0.65, 0.48, 0.45, 0.15, 0.38, 0.35, 0.25, 0.20, 
+bo_mean = np.array([0.72, 0.65, 0.48, 0.45, 0.38, 0.32, 0.35, 0.25, 0.20, 
                     0.18, 0.16, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15])
 bo_std = np.array([0.05, 0.04, 0.03, 0.03, 0.02, 0.03, 0.03, 0.02, 0.02, 
                    0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02])
@@ -67,16 +67,21 @@ ax2_twin = ax2.twinx()
 
 # 最終損失（左軸）
 bars1 = ax2.bar(x_pos - width/2, final_loss, width, color=colors_bar, alpha=0.7, label='最終損失 L(x)')
+
 # 収束イテレーション数（右軸）
-bars2 = ax2_twin.bar(x_pos + width/2, conv_iter, width, color=colors_bar, alpha=0.4, label='収束イテレーション数')  
-ax2.set_ylabel('最終損失 L(x)', fontsize=13)
-ax2_twin.set_ylabel('収束イテレーション数', fontsize=13)  
+bars2 = ax2_twin.bar(x_pos + width/2, conv_iter, width, color=colors_bar, alpha=0.4, label='収束イテレーション数')
+
 ax2.set_xticks(x_pos)
 ax2.set_xticklabels(methods, fontsize=12)
+ax2.set_ylabel('最終損失 L(x)', fontsize=13)
+ax2_twin.set_ylabel('収束イテレーション数', fontsize=13)
 ax2.set_title('Figure 4.5B: 収束効率の比較', fontsize=14, fontweight='bold')
-ax2.set_ylim([0, 0.3])
-ax2_twin.set_ylim([0, 20])  
 ax2.grid(True, alpha=0.3)
-fig.tight_layout()
+
+# 凡例
+bars = bars1 + bars2
+labels = [bar.get_label() for bar in bars]
+ax2.legend(bars, labels, fontsize=11, loc='upper right')
+
 plt.savefig('figure_4_5_optimization_comparison.png', dpi=1000)
 plt.close()
