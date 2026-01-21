@@ -3,6 +3,7 @@ import sys
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import japanize_matplotlib
 # 全体の設定
 plt.rcParams['font.family'] = 'serif'  # セリフ体フォントを使用 (論文の本文と合わせるため)
 plt.rcParams['font.serif'] = ['Times New Roman', 'Times'] # 使用するセリフ体フォント
